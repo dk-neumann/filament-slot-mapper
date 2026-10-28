@@ -4,6 +4,9 @@ A single-page tool for working out which LEDs on a [WLED](https://kno.wled.ge/)-
 sit under each filament spool slot on a shelving rack. It produces `filament-slots.json`,
 the slot map used by the companion [Filament Locator](https://github.com/dk-neumann/filament-locator) app.
 
+**Using Filament Locator?** The mapper is built into it at `http://<locator-host>:7920/mapper`,
+where it saves the map straight to the app. This repository is the standalone version.
+
 ## Rack layout it assumes
 
 - Up to **3 racks**, each with **8 shelves** (A at the bottom to H at the top) and **5 slots** per shelf,

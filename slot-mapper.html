@@ -79,7 +79,7 @@
   <section class="card">
     <h2>Connection</h2>
     <div class="row">
-      <label>WLED host <input type="text" id="host" size="22"></label>
+      <label id="hostWrap">WLED host <input type="text" id="host" size="22"></label>
       <button id="test">Test</button>
       <label>Total LEDs <input type="number" id="total" min="1" max="2048"></label>
       <label>Brightness <input type="range" id="bri" min="5" max="255"></label>
@@ -149,13 +149,14 @@
   <section class="card">
     <h2>Save / load</h2>
     <div class="row">
-      <button id="export" class="primary">Export slots (JSON)</button>
+      <button id="saveServer" class="primary hidden">Save to Filament Locator</button>
+      <button id="export">Export slots (JSON)</button>
       <button id="importBtn">Import…</button>
       <button id="loadSaved">Load saved map from PC</button>
       <input type="file" id="importFile" accept=".json,application/json" class="hidden">
       <button id="reset">Reset everything</button>
     </div>
-    <p class="muted">Your work also auto-saves in this browser. Export gives you the file the Step 2 app will use.</p>
+    <p class="muted" id="saveNote">Your work also auto-saves in this browser. Export gives you the file the Filament Locator app uses.</p>
   </section>
 
   <section class="card">
@@ -229,9 +230,14 @@ function migrateV1(old, st) {
   return st;
 }
 
+// True when this page is served by the Filament Locator app, which proxies WLED and stores the slot map.
+let serverMode = false;
+let hadSavedState = false;
+
 let state = defaultState();
 try {
   const saved = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
+  hadSavedState = !!saved;
   if (saved) {
     if (saved.rackCount == null) saved.total = LEDS_PER_RACK;
     state = Object.assign(defaultState(), saved);
@@ -274,6 +280,11 @@ function baseUrl() {
   return "http://" + state.host.trim().replace(/^https?:\/\//, "").replace(/\/+$/, "");
 }
 
+// WLED JSON API endpoint ("state" or "info"), direct or through the Filament Locator.
+function wledUrl(what) {
+  return serverMode ? `/api/wled/${what}` : `${baseUrl()}/json/${what}`;
+}
+
 function setConn(ok, msg) {
   const el = $("conn");
   el.className = "pill " + (ok ? "ok" : "bad");
@@ -290,7 +301,7 @@ async function send(body) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 4000);
     try {
-      const r = await fetch(baseUrl() + "/json/state", {
+      const r = await fetch(wledUrl("state"), {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(b), signal: ctl.signal
       });
@@ -536,7 +547,8 @@ $("release").addEventListener("click", () => send({ on: true, seg: { id: 0, frz:
 $("test").addEventListener("click", async () => {
   $("info").textContent = "Checking…";
   try {
-    const r = await fetch(baseUrl() + "/json/info", { signal: AbortSignal.timeout(4000) });
+    const r = await fetch(wledUrl("info"), { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error();
     const info = await r.json();
     setConn(true);
     let msg = `Found “${info.name}” — WLED ${info.ver}, ${info.leds.count} LEDs configured, IP ${info.ip}.`;
@@ -544,7 +556,9 @@ $("test").addEventListener("click", async () => {
     $("info").textContent = msg;
   } catch (e) {
     setConn(false);
-    $("info").textContent = "Couldn't reach WLED. Check the host name, or try the controller's IP address instead.";
+    $("info").textContent = serverMode
+      ? "The Filament Locator couldn't reach WLED. Check WLED_HOST in its .env file."
+      : "Couldn't reach WLED. Check the host name, or try the controller's IP address instead.";
   }
 });
 
@@ -556,8 +570,8 @@ document.addEventListener("keydown", e => {
   else if (e.key === "Escape") send({ on: false });
 });
 
-$("export").addEventListener("click", () => {
-  const data = {
+function buildExport() {
+  return {
     version: 2,
     exported: new Date().toISOString(),
     host: state.host,
@@ -571,7 +585,10 @@ $("export").addEventListener("click", () => {
       return { location: key, rack: s.r, shelf: s.sh, position: s.k, start: s.lo, end: s.hi };
     })
   };
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+}
+
+$("export").addEventListener("click", () => {
+  const blob = new Blob([JSON.stringify(buildExport(), null, 2)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "filament-slots.json";
@@ -580,14 +597,14 @@ $("export").addEventListener("click", () => {
 });
 
 // Merge by rack: racks in the map replace those racks here; other racks are kept.
-function mergeMap(d, source) {
+function mergeMap(d, source, ask = true) {
   if (d.version !== 2) {
     migrateV1(d, state);
     return update({ type: "all" });
   }
   const racks = (d.racks || []).slice(0, RACK_COUNT);
   const names = racks.map((_, i) => i + 1).join(", ");
-  if (!confirm(`Replace rack ${names} with the version in ${source}? Other racks are kept.`)) return;
+  if (ask && !confirm(`Replace rack ${names} with the version in ${source}? Other racks are kept.`)) return;
   racks.forEach((rk, i) => {
     state.racks[i] = rk;
     const prefix = `${i + 1}-`;
@@ -598,7 +615,7 @@ function mergeMap(d, source) {
   state.rackCount = Math.max(state.rackCount, racks.length);
   state.total = Math.max(state.total, d.totalLeds || 0);
   state.selected = null;
-  update({ type: "all" });
+  if (ask) update({ type: "all" }); else { save(); render(); }
 }
 
 $("importBtn").addEventListener("click", () => $("importFile").click());
@@ -613,15 +630,35 @@ $("importFile").addEventListener("change", async e => {
   e.target.value = "";
 });
 
-// Loads filament-slots.json from the folder this page is served from (the PC).
+// Fetches the saved slot map: from the Filament Locator, or from the folder this page is served from.
+async function fetchSavedMap() {
+  const r = await fetch((serverMode ? "/api/slots" : "filament-slots.json") + "?t=" + Date.now());
+  if (!r.ok) throw new Error();
+  return r.json();
+}
+
 $("loadSaved").addEventListener("click", async () => {
   try {
-    const r = await fetch("filament-slots.json?t=" + Date.now());
-    if (!r.ok) throw new Error();
-    const d = await r.json();
+    const d = await fetchSavedMap();
     mergeMap(d, `the saved map from ${new Date(d.exported).toLocaleString()}`);
   } catch (err) {
-    alert("Couldn't load filament-slots.json from the computer serving this page.");
+    alert(serverMode ? "The Filament Locator doesn't have a slot map yet."
+                     : "Couldn't load filament-slots.json from the computer serving this page.");
+  }
+});
+
+$("saveServer").addEventListener("click", async () => {
+  const data = buildExport();
+  if (!confirm(`Save this map (${data.slots.length} slots) to the Filament Locator? It replaces the map the app uses now; the old one is kept as a backup.`)) return;
+  try {
+    const r = await fetch("/api/slots", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data)
+    });
+    const res = await r.json();
+    if (!r.ok) throw new Error(res.error);
+    $("saveNote").textContent = `Saved ${data.slots.length} slots to the Filament Locator at ${new Date().toLocaleTimeString()}.`;
+  } catch (e) {
+    alert("Couldn't save: " + (e.message || "no response"));
   }
 });
 
@@ -633,7 +670,25 @@ $("reset").addEventListener("click", () => {
   update({ type: "cursor" });
 });
 
-render();
+// Served by the Filament Locator? Then use its WLED proxy and slot storage.
+async function init() {
+  render();
+  try {
+    const r = await fetch("/api/status", { signal: AbortSignal.timeout(3000) });
+    serverMode = r.ok && "wled" in await r.json();
+  } catch (e) {}
+  if (!serverMode) return;
+  $("hostWrap").classList.add("hidden");
+  $("saveServer").classList.remove("hidden");
+  $("loadSaved").textContent = "Load map from Filament Locator";
+  $("saveNote").textContent = "Your work auto-saves in this browser. Save to Filament Locator updates the map the app uses.";
+  // First visit on this device: start from the map the app is already using.
+  if (!hadSavedState) {
+    try { mergeMap(await fetchSavedMap(), "", false); } catch (e) {}
+  }
+}
+
+init();
 </script>
 </body>
 </html>
