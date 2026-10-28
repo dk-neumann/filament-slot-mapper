@@ -1,0 +1,5 @@
+# The locator app is its own repository
+filament-locator/
+
+# Personal slot maps and backups stay local
+*.json
